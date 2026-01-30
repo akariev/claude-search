@@ -109,6 +109,16 @@ optional arguments:
   --no-content          Don't show match content in output
 ```
 
+## Uninstall
+
+```bash
+# If installed via curl, download and run uninstaller
+curl -fsSL https://raw.githubusercontent.com/akariev/claude-search/main/install.sh | bash -s -- --uninstall
+
+# Or if you have the repo cloned
+./install.sh --uninstall
+```
+
 ## How It Works
 
 Claude Code stores session data in:
