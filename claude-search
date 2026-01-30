@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""
+Claude Code Session Search Tool
+
+Søg i Claude Code sessionshistorik - titler, prompts og fuld samtalehistorik.
+
+Usage:
+    claude-search "søgeord"              # Grundlæggende søgning
+    claude-search "søgeord" -i           # Interaktiv mode - vælg og åbn session
+    claude-search "søgeord" --project X  # Søg kun i projekt X
+    claude-search "søgeord" --context 3  # Vis 3 linjer kontekst
+    claude-search "søgeord" --metadata-only  # Kun søg i titler/prompts
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Generator, Optional
+
+# ANSI color codes
+class Colors:
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+    RESET = '\033[0m'
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN = '\033[96m'
+    WHITE = '\033[97m'
+    BG_YELLOW = '\033[43m'
+    BG_BLACK = '\033[40m'
+
+def supports_color() -> bool:
+    """Check if terminal supports colors."""
+    if not sys.stdout.isatty():
+        return False
+    if os.environ.get('NO_COLOR'):
+        return False
+    return True
+
+USE_COLORS = supports_color()
+
+def c(color: str, text: str) -> str:
+    """Apply color if supported."""
+    if USE_COLORS:
+        return f"{color}{text}{Colors.RESET}"
+    return text
+
+def highlight_match(text: str, pattern: re.Pattern, max_length: int = 200) -> str:
+    """Highlight matches in text."""
+    if len(text) > max_length:
+        # Find first match position
+        match = pattern.search(text)
+        if match:
+            start = max(0, match.start() - 50)
+            end = min(len(text), match.end() + 150)
+            text = ("..." if start > 0 else "") + text[start:end] + ("..." if end < len(text) else "")
+        else:
+            text = text[:max_length] + "..."
+
+    if USE_COLORS:
+        return pattern.sub(lambda m: f"{Colors.BG_YELLOW}{Colors.BG_BLACK}{Colors.BOLD}{m.group()}{Colors.RESET}", text)
+    else:
+        return pattern.sub(lambda m: f"**{m.group()}**", text)
+
+
+class SessionResult:
+    """Holds search result for a session."""
+    def __init__(self, session_id: str, project_name: str, project_path: str,
+                 summary: str, first_prompt: str, message_count: int,
+                 created: str, modified: str, full_path: str, git_branch: str = ""):
+        self.session_id = session_id
+        self.project_name = project_name
+        self.project_path = project_path
+        self.summary = summary
+        self.first_prompt = first_prompt
+        self.message_count = message_count
+        self.created = created
+        self.modified = modified
+        self.full_path = full_path
+        self.git_branch = git_branch
+        self.matches: list[dict] = []  # {'type': 'metadata'|'content', 'text': str, 'context': list}
+        self.match_count = 0
+
+    def get_modified_date(self) -> str:
+        """Get human-readable modified date."""
+        try:
+            dt = datetime.fromisoformat(self.modified.replace('Z', '+00:00'))
+            return dt.strftime('%Y-%m-%d %H:%M')
+        except:
+            return self.modified[:10] if self.modified else "Unknown"
+
+    def get_created_date(self) -> str:
+        """Get human-readable created date."""
+        try:
+            dt = datetime.fromisoformat(self.created.replace('Z', '+00:00'))
+            return dt.strftime('%Y-%m-%d')
+        except:
+            return self.created[:10] if self.created else "Unknown"
+
+
+def get_claude_dir() -> Path:
+    """Get Claude config directory."""
+    return Path.home() / '.claude'
+
+
+def extract_project_name(project_dir_name: str, project_path: str = "") -> str:
+    """Extract readable project name from project path or directory name."""
+    # Common root folders to ignore when finding project name
+    ignore_parts = {'Users', 'home', 'var', 'opt', 'src', ''}
+
+    # Prefer using actual project path if available
+    if project_path:
+        # Extract last meaningful part from path like "/Users/wexoak/temp/bodylab"
+        parts = project_path.rstrip('/').split('/')
+        # Get last 1-2 meaningful parts for context
+        meaningful = [p for p in parts if p and p not in ignore_parts]
+        if meaningful:
+            # Return last part, or "parent/last" if parent is meaningful
+            if len(meaningful) >= 2:
+                return meaningful[-1]  # Just the project name
+            return meaningful[-1]
+
+    # Fallback: Convert "-Users-wexoak-temp-bodylab" to "bodylab"
+    parts = project_dir_name.split('-')
+    for part in reversed(parts):
+        if part and part not in ignore_parts and part != 'wexoak':
+            return part
+    return project_dir_name
+
+
+def find_all_projects() -> Generator[tuple[Path, str], None, None]:
+    """Find all Claude projects with their readable names."""
+    projects_dir = get_claude_dir() / 'projects'
+    if not projects_dir.exists():
+        return
+
+    for project_dir in projects_dir.iterdir():
+        if project_dir.is_dir() and not project_dir.name.startswith('.'):
+            project_name = extract_project_name(project_dir.name)
+            yield project_dir, project_name
+
+
+def load_session_index(project_dir: Path) -> list[dict]:
+    """Load sessions-index.json for a project."""
+    index_file = project_dir / 'sessions-index.json'
+    if not index_file.exists():
+        return []
+
+    try:
+        with open(index_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return data.get('entries', [])
+    except (json.JSONDecodeError, IOError):
+        return []
+
+
+def search_in_text(text: str, pattern: re.Pattern) -> bool:
+    """Check if pattern matches in text."""
+    return bool(pattern.search(text))
+
+
+def search_session_content(jsonl_path: str, pattern: re.Pattern,
+                           context_lines: int = 1) -> list[dict]:
+    """Search through JSONL file for matches in message content."""
+    matches = []
+
+    try:
+        with open(jsonl_path, 'r', encoding='utf-8') as f:
+            messages = []
+            for line in f:
+                try:
+                    data = json.loads(line)
+                    msg_type = data.get('type', '')
+
+                    if msg_type in ('user', 'assistant'):
+                        # Extract text content
+                        message = data.get('message', {})
+                        content = message.get('content', [])
+
+                        text_parts = []
+                        for part in content:
+                            if isinstance(part, dict) and part.get('type') == 'text':
+                                text_parts.append(part.get('text', ''))
+                            elif isinstance(part, str):
+                                text_parts.append(part)
+
+                        full_text = '\n'.join(text_parts)
+                        messages.append({
+                            'type': msg_type,
+                            'text': full_text
+                        })
+                except json.JSONDecodeError:
+                    continue
+
+            # Search through messages
+            for i, msg in enumerate(messages):
+                if search_in_text(msg['text'], pattern):
+                    # Get context
+                    context_before = []
+                    context_after = []
+
+                    for j in range(max(0, i - context_lines), i):
+                        context_before.append(messages[j])
+                    for j in range(i + 1, min(len(messages), i + context_lines + 1)):
+                        context_after.append(messages[j])
+
+                    matches.append({
+                        'type': 'content',
+                        'role': msg['type'],
+                        'text': msg['text'],
+                        'context_before': context_before,
+                        'context_after': context_after
+                    })
+
+                    # Limit matches per session
+                    if len(matches) >= 5:
+                        break
+
+    except (IOError, OSError):
+        pass
+
+    return matches
+
+
+def search_sessions(query: str, project_filter: Optional[str] = None,
+                   metadata_only: bool = False, context_lines: int = 1) -> list[SessionResult]:
+    """Search all sessions for query."""
+    results = []
+    pattern = re.compile(re.escape(query), re.IGNORECASE)
+
+    for project_dir, project_name in find_all_projects():
+        # Apply project filter
+        if project_filter and project_filter.lower() not in project_name.lower():
+            continue
+
+        sessions = load_session_index(project_dir)
+
+        for session in sessions:
+            session_id = session.get('sessionId', '')
+            summary = session.get('summary', '')
+            first_prompt = session.get('firstPrompt', '')
+            message_count = session.get('messageCount', 0)
+            created = session.get('created', '')
+            modified = session.get('modified', '')
+            full_path = session.get('fullPath', '')
+            git_branch = session.get('gitBranch', '')
+            project_path = session.get('projectPath', '')
+
+            # Get better project name from actual path
+            display_name = extract_project_name(project_dir.name, project_path)
+
+            result = SessionResult(
+                session_id=session_id,
+                project_name=display_name,
+                project_path=project_path,
+                summary=summary,
+                first_prompt=first_prompt,
+                message_count=message_count,
+                created=created,
+                modified=modified,
+                full_path=full_path,
+                git_branch=git_branch
+            )
+
+            # Search in metadata
+            metadata_match = False
+            if search_in_text(summary, pattern):
+                result.matches.append({'type': 'metadata', 'field': 'summary', 'text': summary})
+                result.match_count += 1
+                metadata_match = True
+
+            if search_in_text(first_prompt, pattern):
+                result.matches.append({'type': 'metadata', 'field': 'first_prompt', 'text': first_prompt})
+                result.match_count += 1
+                metadata_match = True
+
+            # Search in content if not metadata_only
+            if not metadata_only and full_path and os.path.exists(full_path):
+                content_matches = search_session_content(full_path, pattern, context_lines)
+                for match in content_matches:
+                    result.matches.append(match)
+                    result.match_count += 1
+
+            if result.matches:
+                results.append(result)
+
+    # Sort by match count (descending), then by modified date (newest first)
+    results.sort(key=lambda r: (-r.match_count, r.modified), reverse=False)
+    results.sort(key=lambda r: r.match_count, reverse=True)
+
+    return results
+
+
+def print_separator(char: str = '━', width: int = 60):
+    """Print a separator line."""
+    print(c(Colors.DIM, char * width))
+
+
+def display_result(result: SessionResult, pattern: re.Pattern, index: int,
+                   show_content: bool = True, compact: bool = False):
+    """Display a single search result."""
+    print_separator()
+
+    # Header
+    project = c(Colors.CYAN, f"📁 {result.project_name}")
+    print(f"{c(Colors.BOLD, f'[{index}]')} {project}")
+
+    # Title
+    summary_highlighted = highlight_match(result.summary, pattern, 100)
+    print(f"    📝 {c(Colors.BOLD, summary_highlighted)}")
+
+    # Metadata
+    date_str = result.get_modified_date()
+    meta = f"    🕐 {date_str} | {result.message_count} messages"
+    if result.git_branch:
+        meta += f" | 🌿 {result.git_branch}"
+    print(c(Colors.DIM, meta))
+
+    if compact:
+        return
+
+    # Show matches
+    if show_content and result.matches:
+        for match in result.matches[:3]:  # Limit displayed matches
+            if match['type'] == 'metadata':
+                field = match.get('field', '')
+                if field == 'first_prompt':
+                    text = highlight_match(match['text'], pattern, 150)
+                    print(f"\n    {c(Colors.DIM, 'First prompt:')}")
+                    print(f"    {text}")
+            elif match['type'] == 'content':
+                role_color = Colors.GREEN if match['role'] == 'user' else Colors.BLUE
+                role_label = '👤 User' if match['role'] == 'user' else '🤖 Assistant'
+                print(f"\n    {c(role_color, role_label)}:")
+                text = highlight_match(match['text'], pattern, 200)
+                # Indent multiline
+                text_lines = text.split('\n')[:3]  # Max 3 lines
+                for line in text_lines:
+                    print(f"      {line}")
+                if len(match['text'].split('\n')) > 3:
+                    print(c(Colors.DIM, "      ..."))
+
+
+def interactive_mode(results: list[SessionResult], pattern: re.Pattern):
+    """Interactive mode - let user select and resume a session."""
+    if not results:
+        print(c(Colors.YELLOW, "\nIngen sessioner fundet."))
+        return
+
+    # Display numbered results
+    print(f"\n{c(Colors.BOLD, f'Fandt {len(results)} sessioner:')}\n")
+
+    for i, result in enumerate(results[:20], 1):  # Max 20 results
+        display_result(result, pattern, i, show_content=False, compact=True)
+
+    print_separator()
+
+    # Prompt for selection
+    while True:
+        try:
+            choice = input(f"\n{c(Colors.BOLD, 'Vælg session')} [1-{min(len(results), 20)}] eller 'q' for at afslutte: ").strip()
+
+            if choice.lower() == 'q':
+                print("Afslutter.")
+                return
+
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < min(len(results), 20):
+                    selected = results[idx]
+                    print(f"\n{c(Colors.GREEN, '▶')} Starter: {c(Colors.BOLD, f'claude --resume {selected.session_id}')}")
+                    print(c(Colors.DIM, f"  Projekt: {selected.project_path}"))
+                    print()
+
+                    # Change to project directory and run claude
+                    os.chdir(selected.project_path)
+                    os.execvp('claude', ['claude', '--resume', selected.session_id])
+                else:
+                    print(c(Colors.RED, f"Ugyldigt valg. Vælg mellem 1 og {min(len(results), 20)}."))
+            except ValueError:
+                print(c(Colors.RED, "Indtast et tal eller 'q'."))
+
+        except KeyboardInterrupt:
+            print("\n\nAfslutter.")
+            return
+        except EOFError:
+            return
+
+
+def display_results(results: list[SessionResult], pattern: re.Pattern,
+                   max_results: int = 10, show_content: bool = True):
+    """Display search results."""
+    if not results:
+        print(c(Colors.YELLOW, "\nIngen sessioner fundet."))
+        return
+
+    print(f"\n{c(Colors.BOLD, f'Fandt {len(results)} sessioner:')}")
+
+    for i, result in enumerate(results[:max_results], 1):
+        display_result(result, pattern, i, show_content=show_content)
+
+    print_separator()
+
+    if len(results) > max_results:
+        print(c(Colors.DIM, f"\n... og {len(results) - max_results} flere resultater. Brug --max for at se flere."))
+
+    # Show hint for interactive mode
+    if not sys.stdout.isatty():
+        return
+    print(c(Colors.DIM, "\n💡 Tip: Brug -i for interaktiv mode (vælg og åbn session direkte)"))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Søg i Claude Code sessionshistorik',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  claude-search "authentication"            # Basic search
+  claude-search "webhook" -i                # Interactive mode
+  claude-search "API" --project my-webapp   # Search only in my-webapp project
+  claude-search "error" --context 3         # Show more context
+  claude-search "migration" --metadata-only # Only search in titles/prompts
+        """
+    )
+
+    parser.add_argument('query', help='Søgeord eller frase')
+    parser.add_argument('-i', '--interactive', action='store_true',
+                       help='Interaktiv mode - vælg og åbn session')
+    parser.add_argument('-p', '--project', type=str,
+                       help='Filtrer efter projekt navn')
+    parser.add_argument('-c', '--context', type=int, default=1,
+                       help='Antal kontekst-linjer omkring matches (default: 1)')
+    parser.add_argument('-m', '--metadata-only', action='store_true',
+                       help='Kun søg i metadata (titler, første prompt)')
+    parser.add_argument('--max', type=int, default=10,
+                       help='Maksimalt antal resultater (default: 10)')
+    parser.add_argument('--no-content', action='store_true',
+                       help='Vis ikke match-indhold i output')
+
+    args = parser.parse_args()
+
+    if not args.query:
+        parser.print_help()
+        sys.exit(1)
+
+    # Compile pattern
+    pattern = re.compile(re.escape(args.query), re.IGNORECASE)
+
+    # Search
+    print(c(Colors.DIM, f"Søger efter \"{args.query}\"..."))
+
+    results = search_sessions(
+        query=args.query,
+        project_filter=args.project,
+        metadata_only=args.metadata_only,
+        context_lines=args.context
+    )
+
+    # Display results
+    if args.interactive:
+        interactive_mode(results, pattern)
+    else:
+        display_results(
+            results,
+            pattern,
+            max_results=args.max,
+            show_content=not args.no_content
+        )
+
+
+if __name__ == '__main__':
+    main()
