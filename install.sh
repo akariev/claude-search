@@ -38,13 +38,17 @@ uninstall() {
             read -p "  Remove PATH from $config? [y/N] " -n 1 -r
             echo
             if [[ $REPLY =~ ^[Yy]$ ]]; then
-                # Remove the claude/bin PATH lines
+                # Create backup before modifying
+                cp "$config" "$config.backup.claude-search"
+                echo "  Created backup: $config.backup.claude-search"
+
+                # Remove the claude/bin PATH lines (specific patterns only)
                 if [[ "$(uname)" == "Darwin" ]]; then
-                    sed -i '' '/# Claude Code tools/d' "$config"
-                    sed -i '' '/\.claude\/bin/d' "$config"
+                    sed -i '' '/^# Claude Code tools$/d' "$config"
+                    sed -i '' '/^export PATH="\$HOME\/\.claude\/bin:\$PATH"$/d' "$config"
                 else
-                    sed -i '/# Claude Code tools/d' "$config"
-                    sed -i '/\.claude\/bin/d' "$config"
+                    sed -i '/^# Claude Code tools$/d' "$config"
+                    sed -i '/^export PATH="\$HOME\/\.claude\/bin:\$PATH"$/d' "$config"
                 fi
                 echo -e "✓ ${GREEN}Removed from $config${NC}"
             fi
@@ -62,7 +66,7 @@ uninstall() {
     echo -e "${GREEN}Uninstall complete!${NC}"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo
-    echo "  Restart your terminal or run: source ~/.zshrc"
+    echo "  Restart your terminal to apply changes."
     exit 0
 }
 

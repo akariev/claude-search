@@ -13,10 +13,10 @@ Usage:
 """
 
 import argparse
+import getpass
 import json
 import os
 import re
-import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -114,11 +114,12 @@ def get_claude_dir() -> Path:
 def extract_project_name(project_dir_name: str, project_path: str = "") -> str:
     """Extract readable project name from project path or directory name."""
     # Common root folders to ignore when finding project name
-    ignore_parts = {'Users', 'home', 'var', 'opt', 'src', ''}
+    current_user = getpass.getuser()
+    ignore_parts = {'Users', 'home', 'var', 'opt', 'src', '', current_user}
 
     # Prefer using actual project path if available
     if project_path:
-        # Extract last meaningful part from path like "/Users/wexoak/temp/bodylab"
+        # Extract last meaningful part from path like "/Users/username/temp/myproject"
         parts = project_path.rstrip('/').split('/')
         # Get last 1-2 meaningful parts for context
         meaningful = [p for p in parts if p and p not in ignore_parts]
@@ -128,10 +129,10 @@ def extract_project_name(project_dir_name: str, project_path: str = "") -> str:
                 return meaningful[-1]  # Just the project name
             return meaningful[-1]
 
-    # Fallback: Convert "-Users-wexoak-temp-bodylab" to "bodylab"
+    # Fallback: Convert "-Users-username-temp-myproject" to "myproject"
     parts = project_dir_name.split('-')
     for part in reversed(parts):
-        if part and part not in ignore_parts and part != 'wexoak':
+        if part and part not in ignore_parts:
             return part
     return project_dir_name
 
@@ -293,8 +294,7 @@ def search_sessions(query: str, project_filter: Optional[str] = None,
                 results.append(result)
 
     # Sort by match count (descending), then by modified date (newest first)
-    results.sort(key=lambda r: (-r.match_count, r.modified), reverse=False)
-    results.sort(key=lambda r: r.match_count, reverse=True)
+    results.sort(key=lambda r: (-r.match_count, r.modified or ''), reverse=False)
 
     return results
 
@@ -376,13 +376,32 @@ def interactive_mode(results: list[SessionResult], pattern: re.Pattern):
                 idx = int(choice) - 1
                 if 0 <= idx < min(len(results), 20):
                     selected = results[idx]
+
+                    # Validate project path exists
+                    project_path = Path(selected.project_path).resolve() if selected.project_path else None
+                    if not project_path or not project_path.exists() or not project_path.is_dir():
+                        print(c(Colors.RED, f"Error: Project path no longer exists: {selected.project_path}"))
+                        continue
+
                     print(f"\n{c(Colors.GREEN, '▶')} Starting: {c(Colors.BOLD, f'claude --resume {selected.session_id}')}")
-                    print(c(Colors.DIM, f"  Project: {selected.project_path}"))
+                    print(c(Colors.DIM, f"  Project: {project_path}"))
                     print()
 
                     # Change to project directory and run claude
-                    os.chdir(selected.project_path)
-                    os.execvp('claude', ['claude', '--resume', selected.session_id])
+                    try:
+                        os.chdir(project_path)
+                    except (FileNotFoundError, PermissionError) as e:
+                        print(c(Colors.RED, f"Error: Cannot access project directory: {e}"))
+                        continue
+
+                    try:
+                        os.execvp('claude', ['claude', '--resume', selected.session_id])
+                    except FileNotFoundError:
+                        print(c(Colors.RED, "Error: 'claude' command not found. Is Claude Code installed?"))
+                        sys.exit(1)
+                    except OSError as e:
+                        print(c(Colors.RED, f"Error: Failed to start claude: {e}"))
+                        sys.exit(1)
                 else:
                     print(c(Colors.RED, f"Invalid choice. Select between 1 and {min(len(results), 20)}."))
             except ValueError:
@@ -447,10 +466,6 @@ Examples:
                        help='Don\'t show match content in output')
 
     args = parser.parse_args()
-
-    if not args.query:
-        parser.print_help()
-        sys.exit(1)
 
     # Compile pattern
     pattern = re.compile(re.escape(args.query), re.IGNORECASE)
