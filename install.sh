@@ -58,17 +58,50 @@ fi
 chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
 echo "✓ Made executable"
 
+# Determine shell config file
+if [[ "$SHELL" == *"zsh"* ]]; then
+    SHELL_CONFIG="$HOME/.zshrc"
+elif [[ "$SHELL" == *"bash"* ]]; then
+    # On macOS, prefer .bash_profile for login shells
+    if [[ "$(uname)" == "Darwin" ]] && [ -f "$HOME/.bash_profile" ]; then
+        SHELL_CONFIG="$HOME/.bash_profile"
+    else
+        SHELL_CONFIG="$HOME/.bashrc"
+    fi
+else
+    SHELL_CONFIG="$HOME/.profile"
+fi
+
+PATH_EXPORT='export PATH="$HOME/.claude/bin:$PATH"'
+
 # Check if already in PATH
 if echo "$PATH" | grep -q "$INSTALL_DIR"; then
     echo "✓ $INSTALL_DIR is already in PATH"
+elif grep -q '.claude/bin' "$SHELL_CONFIG" 2>/dev/null; then
+    echo "✓ PATH already configured in $SHELL_CONFIG"
+    echo "  Run: source $SHELL_CONFIG"
 else
     echo
-    echo -e "${YELLOW}Add to PATH:${NC}"
-    echo "  Add this line to your ~/.zshrc or ~/.bashrc:"
+    echo -e "${YELLOW}Add to PATH?${NC}"
+    echo "  Will add to: $SHELL_CONFIG"
     echo
-    echo -e "  ${GREEN}export PATH=\"\$HOME/.claude/bin:\$PATH\"${NC}"
+    read -p "  Add PATH automatically? [Y/n] " -n 1 -r
     echo
-    echo "  Then run: source ~/.zshrc (or ~/.bashrc)"
+
+    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+        # Add newline and PATH export to shell config
+        echo "" >> "$SHELL_CONFIG"
+        echo "# Claude Code tools" >> "$SHELL_CONFIG"
+        echo "$PATH_EXPORT" >> "$SHELL_CONFIG"
+        echo -e "✓ ${GREEN}Added to $SHELL_CONFIG${NC}"
+        echo
+        echo "  To use now, run:"
+        echo -e "  ${GREEN}source $SHELL_CONFIG${NC}"
+    else
+        echo
+        echo "  To add manually, add this line to $SHELL_CONFIG:"
+        echo -e "  ${GREEN}$PATH_EXPORT${NC}"
+    fi
 fi
 
 echo
