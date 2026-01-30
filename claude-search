@@ -2,14 +2,14 @@
 """
 Claude Code Session Search Tool
 
-Søg i Claude Code sessionshistorik - titler, prompts og fuld samtalehistorik.
+Search Claude Code session history - titles, prompts and full conversation history.
 
 Usage:
-    claude-search "søgeord"              # Grundlæggende søgning
-    claude-search "søgeord" -i           # Interaktiv mode - vælg og åbn session
-    claude-search "søgeord" --project X  # Søg kun i projekt X
-    claude-search "søgeord" --context 3  # Vis 3 linjer kontekst
-    claude-search "søgeord" --metadata-only  # Kun søg i titler/prompts
+    claude-search "query"              # Basic search
+    claude-search "query" -i           # Interactive mode - select and open session
+    claude-search "query" --project X  # Search only in project X
+    claude-search "query" --context 3  # Show 3 lines of context
+    claude-search "query" --metadata-only  # Only search in titles/prompts
 """
 
 import argparse
@@ -352,11 +352,11 @@ def display_result(result: SessionResult, pattern: re.Pattern, index: int,
 def interactive_mode(results: list[SessionResult], pattern: re.Pattern):
     """Interactive mode - let user select and resume a session."""
     if not results:
-        print(c(Colors.YELLOW, "\nIngen sessioner fundet."))
+        print(c(Colors.YELLOW, "\nNo sessions found."))
         return
 
     # Display numbered results
-    print(f"\n{c(Colors.BOLD, f'Fandt {len(results)} sessioner:')}\n")
+    print(f"\n{c(Colors.BOLD, f'Found {len(results)} sessions:')}\n")
 
     for i, result in enumerate(results[:20], 1):  # Max 20 results
         display_result(result, pattern, i, show_content=False, compact=True)
@@ -366,30 +366,30 @@ def interactive_mode(results: list[SessionResult], pattern: re.Pattern):
     # Prompt for selection
     while True:
         try:
-            choice = input(f"\n{c(Colors.BOLD, 'Vælg session')} [1-{min(len(results), 20)}] eller 'q' for at afslutte: ").strip()
+            choice = input(f"\n{c(Colors.BOLD, 'Select session')} [1-{min(len(results), 20)}] or 'q' to quit: ").strip()
 
             if choice.lower() == 'q':
-                print("Afslutter.")
+                print("Exiting.")
                 return
 
             try:
                 idx = int(choice) - 1
                 if 0 <= idx < min(len(results), 20):
                     selected = results[idx]
-                    print(f"\n{c(Colors.GREEN, '▶')} Starter: {c(Colors.BOLD, f'claude --resume {selected.session_id}')}")
-                    print(c(Colors.DIM, f"  Projekt: {selected.project_path}"))
+                    print(f"\n{c(Colors.GREEN, '▶')} Starting: {c(Colors.BOLD, f'claude --resume {selected.session_id}')}")
+                    print(c(Colors.DIM, f"  Project: {selected.project_path}"))
                     print()
 
                     # Change to project directory and run claude
                     os.chdir(selected.project_path)
                     os.execvp('claude', ['claude', '--resume', selected.session_id])
                 else:
-                    print(c(Colors.RED, f"Ugyldigt valg. Vælg mellem 1 og {min(len(results), 20)}."))
+                    print(c(Colors.RED, f"Invalid choice. Select between 1 and {min(len(results), 20)}."))
             except ValueError:
-                print(c(Colors.RED, "Indtast et tal eller 'q'."))
+                print(c(Colors.RED, "Enter a number or 'q'."))
 
         except KeyboardInterrupt:
-            print("\n\nAfslutter.")
+            print("\n\nExiting.")
             return
         except EOFError:
             return
@@ -399,10 +399,10 @@ def display_results(results: list[SessionResult], pattern: re.Pattern,
                    max_results: int = 10, show_content: bool = True):
     """Display search results."""
     if not results:
-        print(c(Colors.YELLOW, "\nIngen sessioner fundet."))
+        print(c(Colors.YELLOW, "\nNo sessions found."))
         return
 
-    print(f"\n{c(Colors.BOLD, f'Fandt {len(results)} sessioner:')}")
+    print(f"\n{c(Colors.BOLD, f'Found {len(results)} sessions:')}")
 
     for i, result in enumerate(results[:max_results], 1):
         display_result(result, pattern, i, show_content=show_content)
@@ -410,17 +410,17 @@ def display_results(results: list[SessionResult], pattern: re.Pattern,
     print_separator()
 
     if len(results) > max_results:
-        print(c(Colors.DIM, f"\n... og {len(results) - max_results} flere resultater. Brug --max for at se flere."))
+        print(c(Colors.DIM, f"\n... and {len(results) - max_results} more results. Use --max to see more."))
 
     # Show hint for interactive mode
     if not sys.stdout.isatty():
         return
-    print(c(Colors.DIM, "\n💡 Tip: Brug -i for interaktiv mode (vælg og åbn session direkte)"))
+    print(c(Colors.DIM, "\n💡 Tip: Use -i for interactive mode (select and open session directly)"))
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Søg i Claude Code sessionshistorik',
+        description='Search Claude Code session history',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -432,19 +432,19 @@ Examples:
         """
     )
 
-    parser.add_argument('query', help='Søgeord eller frase')
+    parser.add_argument('query', help='Search term or phrase')
     parser.add_argument('-i', '--interactive', action='store_true',
-                       help='Interaktiv mode - vælg og åbn session')
+                       help='Interactive mode - select and open session')
     parser.add_argument('-p', '--project', type=str,
-                       help='Filtrer efter projekt navn')
+                       help='Filter by project name')
     parser.add_argument('-c', '--context', type=int, default=1,
-                       help='Antal kontekst-linjer omkring matches (default: 1)')
+                       help='Context lines around matches (default: 1)')
     parser.add_argument('-m', '--metadata-only', action='store_true',
-                       help='Kun søg i metadata (titler, første prompt)')
+                       help='Only search in metadata (titles, first prompt)')
     parser.add_argument('--max', type=int, default=10,
-                       help='Maksimalt antal resultater (default: 10)')
+                       help='Maximum results to show (default: 10)')
     parser.add_argument('--no-content', action='store_true',
-                       help='Vis ikke match-indhold i output')
+                       help='Don\'t show match content in output')
 
     args = parser.parse_args()
 
@@ -456,7 +456,7 @@ Examples:
     pattern = re.compile(re.escape(args.query), re.IGNORECASE)
 
     # Search
-    print(c(Colors.DIM, f"Søger efter \"{args.query}\"..."))
+    print(c(Colors.DIM, f"Searching for \"{args.query}\"..."))
 
     results = search_sessions(
         query=args.query,
