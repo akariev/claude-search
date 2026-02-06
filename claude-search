@@ -168,6 +168,47 @@ def search_in_text(text: str, pattern: re.Pattern) -> bool:
     return bool(pattern.search(text))
 
 
+def extract_message_text(message: dict) -> str:
+    """Extract all searchable text from a message, handling all content types."""
+    content = message.get('content', [])
+
+    # Fix: content can be a plain string (common for user messages)
+    if isinstance(content, str):
+        return content
+
+    text_parts = []
+    for part in content:
+        if isinstance(part, str):
+            text_parts.append(part)
+        elif isinstance(part, dict):
+            part_type = part.get('type', '')
+            if part_type == 'text':
+                text_parts.append(part.get('text', ''))
+            elif part_type == 'thinking':
+                # Search in Claude's reasoning/analysis
+                text_parts.append(part.get('thinking', ''))
+            elif part_type == 'tool_use':
+                # Search in tool call inputs (contains code, file paths, queries)
+                tool_input = part.get('input', {})
+                if isinstance(tool_input, dict):
+                    for val in tool_input.values():
+                        if isinstance(val, str):
+                            text_parts.append(val)
+                elif isinstance(tool_input, str):
+                    text_parts.append(tool_input)
+            elif part_type == 'tool_result':
+                # Search in tool results
+                tool_content = part.get('content', '')
+                if isinstance(tool_content, str):
+                    text_parts.append(tool_content)
+                elif isinstance(tool_content, list):
+                    for item in tool_content:
+                        if isinstance(item, dict) and item.get('type') == 'text':
+                            text_parts.append(item.get('text', ''))
+
+    return '\n'.join(text_parts)
+
+
 def search_session_content(jsonl_path: str, pattern: re.Pattern,
                            context_lines: int = 1) -> list[dict]:
     """Search through JSONL file for matches in message content."""
@@ -182,18 +223,8 @@ def search_session_content(jsonl_path: str, pattern: re.Pattern,
                     msg_type = data.get('type', '')
 
                     if msg_type in ('user', 'assistant'):
-                        # Extract text content
                         message = data.get('message', {})
-                        content = message.get('content', [])
-
-                        text_parts = []
-                        for part in content:
-                            if isinstance(part, dict) and part.get('type') == 'text':
-                                text_parts.append(part.get('text', ''))
-                            elif isinstance(part, str):
-                                text_parts.append(part)
-
-                        full_text = '\n'.join(text_parts)
+                        full_text = extract_message_text(message)
                         messages.append({
                             'type': msg_type,
                             'text': full_text
@@ -231,6 +262,63 @@ def search_session_content(jsonl_path: str, pattern: re.Pattern,
     return matches
 
 
+def discover_unindexed_sessions(project_dir: Path, indexed_ids: set) -> list[dict]:
+    """Find JSONL session files not present in sessions-index.json.
+
+    Extracts basic metadata from the first line of each JSONL file.
+    """
+    unindexed = []
+    for jsonl_file in project_dir.glob('*.jsonl'):
+        session_id = jsonl_file.stem
+        if session_id in indexed_ids or session_id == 'sessions-index':
+            continue
+
+        # Extract metadata from the first JSONL line
+        try:
+            with open(jsonl_file, 'r', encoding='utf-8') as f:
+                first_line = f.readline()
+                if not first_line:
+                    continue
+                data = json.loads(first_line)
+
+            stat = jsonl_file.stat()
+            created = data.get('timestamp', '')
+            project_path = data.get('cwd', '')
+            git_branch = data.get('gitBranch', '')
+
+            # Extract first prompt from user message content
+            first_prompt = ''
+            message = data.get('message', {})
+            if message:
+                content = message.get('content', '')
+                if isinstance(content, str):
+                    first_prompt = content[:200]
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, str):
+                            first_prompt = part[:200]
+                            break
+                        elif isinstance(part, dict) and part.get('type') == 'text':
+                            first_prompt = part.get('text', '')[:200]
+                            break
+
+            unindexed.append({
+                'sessionId': session_id,
+                'fullPath': str(jsonl_file),
+                'firstPrompt': first_prompt,
+                'summary': '',
+                'messageCount': 0,
+                'created': created,
+                'modified': datetime.fromtimestamp(stat.st_mtime).isoformat() + 'Z',
+                'gitBranch': git_branch,
+                'projectPath': project_path,
+            })
+        except (json.JSONDecodeError, IOError, OSError):
+            continue
+
+    return unindexed
+
+
 def search_sessions(query: str, project_filter: Optional[str] = None,
                    metadata_only: bool = False, context_lines: int = 1) -> list[SessionResult]:
     """Search all sessions for query."""
@@ -242,7 +330,13 @@ def search_sessions(query: str, project_filter: Optional[str] = None,
         if project_filter and project_filter.lower() not in project_name.lower():
             continue
 
+        # Load indexed sessions
         sessions = load_session_index(project_dir)
+        indexed_ids = {s.get('sessionId', '') for s in sessions}
+
+        # Discover unindexed sessions from JSONL files
+        unindexed = discover_unindexed_sessions(project_dir, indexed_ids)
+        sessions.extend(unindexed)
 
         for session in sessions:
             session_id = session.get('sessionId', '')
