@@ -262,10 +262,12 @@ def search_session_content(jsonl_path: str, pattern: re.Pattern,
     return matches
 
 
-def discover_unindexed_sessions(project_dir: Path, indexed_ids: set) -> list[dict]:
+def discover_unindexed_sessions(project_dir: Path, indexed_ids: set,
+                                 default_project_path: str = '') -> list[dict]:
     """Find JSONL session files not present in sessions-index.json.
 
-    Extracts basic metadata from the first line of each JSONL file.
+    Scans early lines of each JSONL file to extract metadata, since the first
+    line may be a snapshot or progress entry rather than a user message.
     """
     unindexed = []
     for jsonl_file in project_dir.glob('*.jsonl'):
@@ -273,47 +275,64 @@ def discover_unindexed_sessions(project_dir: Path, indexed_ids: set) -> list[dic
         if session_id in indexed_ids or session_id == 'sessions-index':
             continue
 
-        # Extract metadata from the first JSONL line
         try:
-            with open(jsonl_file, 'r', encoding='utf-8') as f:
-                first_line = f.readline()
-                if not first_line:
-                    continue
-                data = json.loads(first_line)
-
             stat = jsonl_file.stat()
-            created = data.get('timestamp', '')
-            project_path = data.get('cwd', '')
-            git_branch = data.get('gitBranch', '')
-
-            # Extract first prompt from user message content
+            project_path = ''
+            git_branch = ''
             first_prompt = ''
-            message = data.get('message', {})
-            if message:
-                content = message.get('content', '')
-                if isinstance(content, str):
-                    first_prompt = content[:200]
-                elif isinstance(content, list):
-                    for part in content:
-                        if isinstance(part, str):
-                            first_prompt = part[:200]
-                            break
-                        elif isinstance(part, dict) and part.get('type') == 'text':
-                            first_prompt = part.get('text', '')[:200]
-                            break
+            created = ''
+            message_count = 0
+
+            with open(jsonl_file, 'r', encoding='utf-8') as f:
+                for i, line in enumerate(f):
+                    if i >= 50:
+                        break
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    msg_type = data.get('type', '')
+
+                    # Pick up cwd/gitBranch from any line that has them
+                    if not project_path and data.get('cwd'):
+                        project_path = data['cwd']
+                    if not git_branch and data.get('gitBranch'):
+                        git_branch = data['gitBranch']
+                    if not created and data.get('timestamp'):
+                        created = data['timestamp']
+
+                    # Count user/assistant messages
+                    if msg_type in ('user', 'assistant'):
+                        message_count += 1
+
+                    # Extract first prompt from first user message
+                    if msg_type == 'user' and not first_prompt:
+                        message = data.get('message', {})
+                        content = message.get('content', '')
+                        if isinstance(content, str):
+                            first_prompt = content[:200]
+                        elif isinstance(content, list):
+                            for part in content:
+                                if isinstance(part, str):
+                                    first_prompt = part[:200]
+                                    break
+                                elif isinstance(part, dict) and part.get('type') == 'text':
+                                    first_prompt = part.get('text', '')[:200]
+                                    break
 
             unindexed.append({
                 'sessionId': session_id,
                 'fullPath': str(jsonl_file),
                 'firstPrompt': first_prompt,
                 'summary': '',
-                'messageCount': 0,
+                'messageCount': message_count,
                 'created': created,
                 'modified': datetime.fromtimestamp(stat.st_mtime).isoformat() + 'Z',
                 'gitBranch': git_branch,
-                'projectPath': project_path,
+                'projectPath': project_path or default_project_path,
             })
-        except (json.JSONDecodeError, IOError, OSError):
+        except (IOError, OSError):
             continue
 
     return unindexed
@@ -334,8 +353,23 @@ def search_sessions(query: str, project_filter: Optional[str] = None,
         sessions = load_session_index(project_dir)
         indexed_ids = {s.get('sessionId', '') for s in sessions}
 
+        # Derive default project path from indexed sessions or index file
+        default_project_path = ''
+        for s in sessions:
+            if s.get('projectPath'):
+                default_project_path = s['projectPath']
+                break
+        if not default_project_path:
+            index_file = project_dir / 'sessions-index.json'
+            try:
+                with open(index_file, 'r', encoding='utf-8') as f:
+                    idx_data = json.load(f)
+                    default_project_path = idx_data.get('originalPath', '')
+            except (json.JSONDecodeError, IOError):
+                pass
+
         # Discover unindexed sessions from JSONL files
-        unindexed = discover_unindexed_sessions(project_dir, indexed_ids)
+        unindexed = discover_unindexed_sessions(project_dir, indexed_ids, default_project_path)
         sessions.extend(unindexed)
 
         for session in sessions:
